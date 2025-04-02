@@ -30,7 +30,7 @@ class TrainConfig:
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
     max_timesteps: int = int(1e6)  # Max time steps to run environment
-    checkpoints_path: Optional[str] = None  # Save path
+    checkpoints_path: Optional[str] = "./data/"  # Save path
     load_model: str = ""  # Model load file name, "" doesn't load
 
     # CQL
@@ -71,8 +71,11 @@ class TrainConfig:
     group: str = "CQL-D4RL"
     name: str = "CQL"
 
+    # Model Merging Args
+    ctrl_cost_weight: float = 0.1
+
     def __post_init__(self):
-        self.name = f"{self.name}-{self.env}-{str(uuid.uuid4())[:8]}"
+        self.name = f"{self.name}-{self.env}-{self.ctrl_cost_weight}-{str(uuid.uuid4())[:8]}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
 
@@ -202,22 +205,28 @@ def wandb_init(config: dict) -> None:
 
 @torch.no_grad()
 def eval_actor(
-    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
+    env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int, ctrl_cost_weight: float
 ) -> np.ndarray:
     env.seed(seed)
     actor.eval()
     episode_rewards = []
+    episode_costs = []
     for _ in range(n_episodes):
         state, done = env.reset(), False
         episode_reward = 0.0
+        episode_cost = 0.0
         while not done:
             action = actor.act(state, device)
             state, reward, done, _ = env.step(action)
+            ctrl_cost = (0.1 - ctrl_cost_weight) * np.linalg.norm(action)
+            reward = reward + ctrl_cost
             episode_reward += reward
+            episode_cost += ctrl_cost
         episode_rewards.append(episode_reward)
+        episode_costs.append(episode_cost)
 
     actor.train()
-    return np.asarray(episode_rewards)
+    return np.asarray(episode_rewards), np.asarray(episode_costs)
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -238,6 +247,7 @@ def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, f
 def modify_reward(
     dataset: Dict,
     env_name: str,
+    ctrl_cost_weight: float = 0.1,
     max_episode_steps: int = 1000,
     reward_scale: float = 1.0,
     reward_bias: float = 0.0,
@@ -248,6 +258,19 @@ def modify_reward(
         dataset["rewards"] *= max_episode_steps
     dataset["rewards"] = dataset["rewards"] * reward_scale + reward_bias
 
+
+def penalty_adjusted_reward(dataset: Dict,
+                            ctrl_cost_weight: float = 0.1):
+    """
+    Recomputing the reward based on different levels of desired penalty.
+    """
+
+    print(np.mean(dataset["rewards"]))
+
+    action_norm = np.linalg.norm(dataset["actions"], axis=-1)
+    velocity_reward = dataset["rewards"] + 0.1 * action_norm
+    dataset["rewards"] = velocity_reward - ctrl_cost_weight * action_norm
+    print(np.mean(dataset["rewards"]))
 
 def extend_and_repeat(tensor: torch.Tensor, dim: int, repeat: int) -> torch.Tensor:
     return tensor.unsqueeze(dim).repeat_interleave(repeat, dim=dim)
@@ -835,17 +858,20 @@ class ContinuousCQL:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    env = gym.make(config.env, ctrl_cost_weight=config.ctrl_cost_weight)
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
     dataset = d4rl.qlearning_dataset(env)
 
+    penalty_adjusted_reward(dataset, ctrl_cost_weight=config.ctrl_cost_weight)
+
     if config.normalize_reward:
         modify_reward(
             dataset,
             config.env,
+            ctrl_cost_weight=config.ctrl_cost_weight,
             reward_scale=config.reward_scale,
             reward_bias=config.reward_bias,
         )
@@ -944,6 +970,7 @@ def train(config: TrainConfig):
         policy_file = Path(config.load_model)
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
+        print("Loaded model from path {config.load_model}")
 
     wandb_init(asdict(config))
 
@@ -956,27 +983,31 @@ def train(config: TrainConfig):
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
             print(f"Time steps: {t + 1}")
-            eval_scores = eval_actor(
+            eval_scores, eval_costs = eval_actor(
                 env,
                 actor,
                 device=config.device,
                 n_episodes=config.n_episodes,
                 seed=config.seed,
+                ctrl_cost_weight=config.ctrl_cost_weight,
             )
             eval_score = eval_scores.mean()
+            eval_cost = eval_costs.mean()
             normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
             evaluations.append(normalized_eval_score)
             print("---------------------------------------")
             print(
                 f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}, Cost: {eval_cost:.3f}"
             )
             print("---------------------------------------")
             if config.checkpoints_path:
+                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt")
                 torch.save(
                     trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
+                    checkpoint_path,
                 )
+                wandb.save(checkpoint_path)
             wandb.log(
                 {"d4rl_normalized_score": normalized_eval_score},
                 step=trainer.total_it,
