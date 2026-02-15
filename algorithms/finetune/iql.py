@@ -3,13 +3,14 @@
 import copy
 import os
 import random
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import minari
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -31,8 +32,8 @@ ENVS_WITH_GOAL = ("antmaze", "pen", "door", "hammer", "relocate")
 @dataclass
 class TrainConfig:
     # Experiment
-    device: str = "cuda"
-    env: str = "antmaze-umaze-v2"  # OpenAI gym environment name
+    device: str = "cpu"
+    env: str = "mujoco/hopper/medium-v0"   # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_seed: int = 0  # Eval environment seed
     eval_freq: int = int(5e4)  # How often (time steps) we evaluate
@@ -59,7 +60,7 @@ class TrainConfig:
     actor_lr: float = 3e-4  # Actor learning rate
     # Wandb logging
     project: str = "CORL"
-    group: str = "IQL-D4RL"
+    group: str = "IQL-Minari"
     name: str = "IQL"
 
     def __post_init__(self):
@@ -99,7 +100,8 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    # Gymnasium requires observation_space argument for TransformObservation
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
@@ -181,8 +183,66 @@ class ReplayBuffer:
         # raise NotImplementedError
 
 
+def minari_to_qlearning_dataset(minari_dataset) -> Dict[str, np.ndarray]:
+    """Convert Minari dataset to qlearning format (D4RL-like format).
+    
+    Args:
+        minari_dataset: Minari dataset object
+        
+    Returns:
+        Dictionary with keys: observations, actions, rewards, next_observations, terminals
+    """
+    observations = []
+    actions = []
+    rewards = []
+    next_observations = []
+    terminals = []
+    
+    # Iterate through all episodes in the dataset
+    for episode_id in minari_dataset.episode_indices:
+        episode = minari_dataset[episode_id]
+        
+        # Minari episode data structure
+        # Access observations, actions, rewards, terminations, truncations
+        episode_obs = np.array(episode.observations, dtype=np.float32)
+        episode_actions = np.array(episode.actions, dtype=np.float32)
+        episode_rewards = np.array(episode.rewards, dtype=np.float32)
+        
+        # Handle terminations and truncations
+        if hasattr(episode, 'terminations'):
+            episode_terminations = np.array(episode.terminations, dtype=bool)
+        else:
+            episode_terminations = np.zeros(len(episode_obs), dtype=bool)
+        
+        if hasattr(episode, 'truncations'):
+            episode_truncations = np.array(episode.truncations, dtype=bool)
+        else:
+            episode_truncations = np.zeros(len(episode_obs), dtype=bool)
+        
+        # Create terminals: True if episode ends (termination or truncation)
+        episode_dones = episode_terminations | episode_truncations
+        
+        # For each step in the episode, create a transition
+        # We create transitions for all steps except the last one
+        for i in range(len(episode_obs) - 1):
+            observations.append(episode_obs[i])
+            actions.append(episode_actions[i])
+            rewards.append(episode_rewards[i])
+            next_observations.append(episode_obs[i + 1])
+            terminals.append(episode_dones[i])
+    
+    return {
+        "observations": np.array(observations, dtype=np.float32),
+        "actions": np.array(actions, dtype=np.float32),
+        "rewards": np.array(rewards, dtype=np.float32),
+        "next_observations": np.array(next_observations, dtype=np.float32),
+        "terminals": np.array(terminals, dtype=np.float32),
+    }
+
+
 def set_env_seed(env: Optional[gym.Env], seed: int):
-    env.seed(seed)
+    # Gymnasium uses reset(seed=seed) instead of seed()
+    env.reset(seed=seed)
     env.action_space.seed(seed)
 
 
@@ -206,7 +266,8 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         id=str(uuid.uuid4()),
     )
-    wandb.run.save()
+    # wandb.run.save() is no longer needed in newer wandb versions
+    # The run is automatically saved when wandb.init() is called
 
 
 def is_goal_reached(reward: float, info: Dict) -> bool:
@@ -219,17 +280,22 @@ def is_goal_reached(reward: float, info: Dict) -> bool:
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    env.seed(seed)
+    # Gymnasium uses reset(seed=seed) instead of seed()
+    env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     successes = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        # Gymnasium reset() returns (observation, info) tuple
+        state, _ = env.reset()
+        done = False
         episode_reward = 0.0
         goal_achieved = False
         while not done:
             action = actor.act(state, device)
-            state, reward, done, env_infos = env.step(action)
+            # Gymnasium step() returns (observation, reward, terminated, truncated, info)
+            state, reward, terminated, truncated, env_infos = env.step(action)
+            done = terminated or truncated
             episode_reward += reward
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
@@ -565,8 +631,33 @@ class ImplicitQLearning:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
-    eval_env = gym.make(config.env)
+    # Load Minari dataset
+    # Minari uses the same naming convention for D4RL datasets
+    minari_dataset = minari.load_dataset(config.env)
+    
+    # Convert Minari dataset to qlearning format
+    dataset = minari_to_qlearning_dataset(minari_dataset)
+    
+    # Create environment for evaluation
+    # Extract base environment name (e.g., "halfcheetah-medium-expert-v2" -> "halfcheetah")
+    # For most MuJoCo envs, we can use the dataset's env_spec
+    try:
+        # Try to get environment from Minari dataset metadata
+        env_spec = minari_dataset.env_spec
+        if env_spec is not None:
+            env = gym.make(env_spec.id)
+            eval_env = gym.make(env_spec.id)
+        else:
+            # Fallback: extract base name from config.env
+            base_name = config.env.split("-")[0]
+            env = gym.make(f"{base_name}-v0")
+            eval_env = gym.make(f"{base_name}-v0")
+    except Exception:
+        # Final fallback: try to create env from config name directly
+        # Remove dataset suffix if present (e.g., "-medium-expert-v2" -> "")
+        base_name = config.env.split("-medium")[0].split("-expert")[0].split("-random")[0].split("-replay")[0]
+        env = gym.make(f"{base_name}-v0")
+        eval_env = gym.make(f"{base_name}-v0")
 
     is_env_with_goal = config.env.startswith(ENVS_WITH_GOAL)
 
@@ -574,8 +665,6 @@ def train(config: TrainConfig):
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-
-    dataset = d4rl.qlearning_dataset(env)
 
     reward_mod_dict = {}
     if config.normalize_reward:
@@ -647,9 +736,20 @@ def train(config: TrainConfig):
         "max_steps": config.offline_iterations,
     }
 
-    print("---------------------------------------")
-    print(f"Training IQL, Env: {config.env}, Seed: {seed}")
-    print("---------------------------------------")
+    print("=" * 70)
+    print(f"Training IQL (Finetune)")
+    print("=" * 70)
+    print(f"Environment: {config.env}")
+    print(f"Seed: {seed}, Eval Seed: {config.eval_seed}")
+    print(f"Device: {config.device}")
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"Offline iterations: {config.offline_iterations:,}")
+    print(f"Online iterations: {config.online_iterations:,}")
+    print(f"Total iterations: {config.offline_iterations + config.online_iterations:,}")
+    print(f"Batch size: {config.batch_size}")
+    print(f"Evaluation frequency: {config.eval_freq:,} steps")
+    print(f"Beta: {config.beta}, IQL tau: {config.iql_tau}")
+    print("=" * 70)
 
     # Initialize actor
     trainer = ImplicitQLearning(**kwargs)
@@ -662,19 +762,31 @@ def train(config: TrainConfig):
     wandb_init(asdict(config))
 
     evaluations = []
-
-    state, done = env.reset(), False
+    
+    # Gymnasium reset() returns (observation, info) tuple
+    state, _ = env.reset()
+    done = False
     episode_return = 0
     episode_step = 0
     goal_achieved = False
 
     eval_successes = []
     train_successes = []
+    
+    start_time = time.time()
+    total_iterations = int(config.offline_iterations) + int(config.online_iterations)
+    log_freq = max(100, config.eval_freq // 10)  # Log progress every 10% of eval_freq
 
-    print("Offline pretraining")
-    for t in range(int(config.offline_iterations) + int(config.online_iterations)):
+    print("\nStarting training...")
+    print("-" * 70)
+    print("Offline pretraining phase")
+    print("-" * 70)
+    
+    for t in range(total_iterations):
         if t == config.offline_iterations:
-            print("Online tuning")
+            print("\n" + "=" * 70)
+            print("Switching to Online tuning phase")
+            print("=" * 70)
         online_log = {}
         if t >= config.offline_iterations:
             episode_step += 1
@@ -692,7 +804,9 @@ def train(config: TrainConfig):
                 action += noise
             action = torch.clamp(max_action * action, -max_action, max_action)
             action = action.cpu().data.numpy().flatten()
-            next_state, reward, done, env_infos = env.step(action)
+            # Gymnasium step() returns (observation, reward, terminated, truncated, info)
+            next_state, reward, terminated, truncated, env_infos = env.step(action)
+            done = terminated or truncated
 
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
@@ -708,17 +822,17 @@ def train(config: TrainConfig):
             replay_buffer.add_transition(state, action, reward, next_state, real_done)
             state = next_state
             if done:
-                state, done = env.reset(), False
+                # Gymnasium reset() returns (observation, info) tuple
+                state, _ = env.reset()
+                done = False
                 # Valid only for envs with goal, e.g. AntMaze, Adroit
                 if is_env_with_goal:
                     train_successes.append(goal_achieved)
                     online_log["train/regret"] = np.mean(1 - np.array(train_successes))
                     online_log["train/is_success"] = float(goal_achieved)
                 online_log["train/episode_return"] = episode_return
-                normalized_return = eval_env.get_normalized_score(episode_return)
-                online_log["train/d4rl_normalized_episode_return"] = (
-                    normalized_return * 100.0
-                )
+                # Minari doesn't have get_normalized_score, so we use raw score
+                online_log["train/episode_return_normalized"] = episode_return
                 online_log["train/episode_length"] = episode_step
                 episode_return = 0
                 episode_step = 0
@@ -732,39 +846,92 @@ def train(config: TrainConfig):
         )
         log_dict.update(online_log)
         wandb.log(log_dict, step=trainer.total_it)
+        
+        # Progress logging
+        if (t + 1) % log_freq == 0:
+            elapsed_time = time.time() - start_time
+            progress = (t + 1) / total_iterations * 100
+            phase = "Online" if t >= config.offline_iterations else "Offline"
+            steps_per_sec = (t + 1) / elapsed_time if elapsed_time > 0 else 0
+            eta_seconds = (total_iterations - (t + 1)) / steps_per_sec if steps_per_sec > 0 else 0
+            eta_minutes = eta_seconds / 60
+            
+            print(f"\n[{t + 1:,}/{total_iterations:,}] ({progress:.1f}%) [{phase}] | "
+                  f"Time: {elapsed_time/60:.1f}m | "
+                  f"Speed: {steps_per_sec:.1f} steps/s | "
+                  f"ETA: {eta_minutes:.1f}m")
+            print(f"  Q Loss: {log_dict.get('q_loss', 0):.4f} | "
+                  f"V Loss: {log_dict.get('v_loss', 0):.4f} | "
+                  f"Actor Loss: {log_dict.get('actor_loss', 0):.4f}")
+            if t >= config.offline_iterations:
+                print(f"  Episode Return: {online_log.get('train/episode_return', 0):.3f} | "
+                      f"Episode Length: {online_log.get('train/episode_length', 0):.0f}")
+        
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
+            eval_start_time = time.time()
+            eval_progress = (t + 1) / total_iterations * 100
+            phase = "Online" if t >= config.offline_iterations else "Offline"
+            print("\n" + "=" * 70)
+            print(f"Evaluation at step {t + 1:,} ({eval_progress:.1f}% complete) [{phase}]")
+            print("=" * 70)
+            
             eval_scores, success_rate = eval_actor(
                 eval_env,
                 actor,
                 device=config.device,
                 n_episodes=config.n_episodes,
-                seed=config.seed,
+                seed=config.eval_seed,
             )
             eval_score = eval_scores.mean()
+            eval_std = eval_scores.std()
+            eval_min = eval_scores.min()
+            eval_max = eval_scores.max()
+            
             eval_log = {}
-            normalized = eval_env.get_normalized_score(eval_score)
+            # Minari doesn't have get_normalized_score, so we use raw score
+            normalized_eval_score = eval_score  # Use raw score
             # Valid only for envs with goal, e.g. AntMaze, Adroit
             if t >= config.offline_iterations and is_env_with_goal:
                 eval_successes.append(success_rate)
-                eval_log["eval/regret"] = np.mean(1 - np.array(train_successes))
+                eval_log["eval/regret"] = np.mean(1 - np.array(eval_successes))
                 eval_log["eval/success_rate"] = success_rate
-            normalized_eval_score = normalized * 100.0
+            eval_log["eval/score"] = normalized_eval_score
             evaluations.append(normalized_eval_score)
-            eval_log["eval/d4rl_normalized_score"] = normalized_eval_score
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
-            )
-            print("---------------------------------------")
+            
+            eval_time = time.time() - eval_start_time
+            
+            print(f"Evaluation Results ({config.n_episodes} episodes, {eval_time:.1f}s):")
+            print(f"  Mean Score: {eval_score:.3f} ± {eval_std:.3f}")
+            print(f"  Min Score: {eval_min:.3f}, Max Score: {eval_max:.3f}")
+            if is_env_with_goal and t >= config.offline_iterations:
+                print(f"  Success Rate: {success_rate:.3f}")
+            if len(evaluations) > 1:
+                print(f"  Best Score So Far: {max(evaluations):.3f}")
+                print(f"  Improvement: {evaluations[-1] - evaluations[0]:.3f}")
+            print("=" * 70)
+            
             if config.checkpoints_path is not None:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
-                )
+                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{t + 1}.pt")
+                torch.save(trainer.state_dict(), checkpoint_path)
+                print(f"Checkpoint saved: {checkpoint_path}")
+            
             wandb.log(eval_log, step=trainer.total_it)
+            print()  # Empty line for readability
+    
+    # Final summary
+    total_time = time.time() - start_time
+    print("\n" + "=" * 70)
+    print("Training Complete!")
+    print("=" * 70)
+    print(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+    print(f"Total iterations: {total_iterations:,}")
+    print(f"Average speed: {total_iterations/total_time:.1f} steps/s")
+    if evaluations:
+        print(f"\nFinal Evaluation Score: {evaluations[-1]:.3f}")
+        print(f"Best Evaluation Score: {max(evaluations):.3f}")
+        print(f"Average Evaluation Score: {sum(evaluations)/len(evaluations):.3f}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

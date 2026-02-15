@@ -2,14 +2,15 @@
 # https://arxiv.org/pdf/2006.04779.pdf
 import os
 import random
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import d4rl
-import gym
+import minari
+import gymnasium as gym
 import numpy as np
 import pyrallis
 import torch
@@ -24,8 +25,8 @@ TensorBatch = List[torch.Tensor]
 @dataclass
 class TrainConfig:
     # Experiment
-    device: str = "cuda"
-    env: str = "halfcheetah-medium-expert-v2"  # OpenAI gym environment name
+    device: str = "cpu"
+    env: str = "mujoco/hopper/medium-v0"  # OpenAI gym environment name
     seed: int = 0  # Sets Gym, PyTorch and Numpy seeds
     eval_freq: int = int(5e3)  # How often (time steps) we evaluate
     n_episodes: int = 10  # How many episodes run during evaluation
@@ -68,7 +69,7 @@ class TrainConfig:
 
     # Wandb logging
     project: str = "CORL"
-    group: str = "CQL-D4RL"
+    group: str = "CQL-Minari"
     name: str = "CQL"
 
     def __post_init__(self):
@@ -108,7 +109,8 @@ def wrap_env(
         # Please be careful, here reward is multiplied by scale!
         return reward_scale * reward
 
-    env = gym.wrappers.TransformObservation(env, normalize_state)
+    # Gymnasium requires observation_space argument for TransformObservation
+    env = gym.wrappers.TransformObservation(env, normalize_state, env.observation_space)
     if reward_scale != 1.0:
         env = gym.wrappers.TransformReward(env, scale_reward)
     return env
@@ -180,7 +182,8 @@ def set_seed(
     seed: int, env: Optional[gym.Env] = None, deterministic_torch: bool = False
 ):
     if env is not None:
-        env.seed(seed)
+        # Gymnasium uses reset(seed=seed) instead of seed()
+        env.reset(seed=seed)
         env.action_space.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -197,27 +200,90 @@ def wandb_init(config: dict) -> None:
         name=config["name"],
         id=str(uuid.uuid4()),
     )
-    wandb.run.save()
+    # wandb.run.save() is no longer needed in newer wandb versions
+    # The run is automatically saved when wandb.init() is called
 
 
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
 ) -> np.ndarray:
-    env.seed(seed)
+    # Gymnasium uses reset(seed=seed) instead of seed()
+    env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     for _ in range(n_episodes):
-        state, done = env.reset(), False
+        # Gymnasium reset() returns (observation, info) tuple
+        state, _ = env.reset()
+        done = False
         episode_reward = 0.0
         while not done:
             action = actor.act(state, device)
-            state, reward, done, _ = env.step(action)
+            # Gymnasium step() returns (observation, reward, terminated, truncated, info)
+            state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             episode_reward += reward
         episode_rewards.append(episode_reward)
 
     actor.train()
     return np.asarray(episode_rewards)
+
+
+def minari_to_qlearning_dataset(minari_dataset) -> Dict[str, np.ndarray]:
+    """Convert Minari dataset to qlearning format (D4RL-like format).
+    
+    Args:
+        minari_dataset: Minari dataset object
+        
+    Returns:
+        Dictionary with keys: observations, actions, rewards, next_observations, terminals
+    """
+    observations = []
+    actions = []
+    rewards = []
+    next_observations = []
+    terminals = []
+    
+    # Iterate through all episodes in the dataset
+    for episode_id in minari_dataset.episode_indices:
+        episode = minari_dataset[episode_id]
+        
+        # Minari episode data structure
+        # Access observations, actions, rewards, terminations, truncations
+        episode_obs = np.array(episode.observations, dtype=np.float32)
+        episode_actions = np.array(episode.actions, dtype=np.float32)
+        episode_rewards = np.array(episode.rewards, dtype=np.float32)
+        
+        # Handle terminations and truncations
+        if hasattr(episode, 'terminations'):
+            episode_terminations = np.array(episode.terminations, dtype=bool)
+        else:
+            episode_terminations = np.zeros(len(episode_obs), dtype=bool)
+        
+        if hasattr(episode, 'truncations'):
+            episode_truncations = np.array(episode.truncations, dtype=bool)
+        else:
+            episode_truncations = np.zeros(len(episode_obs), dtype=bool)
+        
+        # Create terminals: True if episode ends (termination or truncation)
+        episode_dones = episode_terminations | episode_truncations
+        
+        # For each step in the episode, create a transition
+        # We create transitions for all steps except the last one
+        for i in range(len(episode_obs) - 1):
+            observations.append(episode_obs[i])
+            actions.append(episode_actions[i])
+            rewards.append(episode_rewards[i])
+            next_observations.append(episode_obs[i + 1])
+            terminals.append(episode_dones[i])
+    
+    return {
+        "observations": np.array(observations, dtype=np.float32),
+        "actions": np.array(actions, dtype=np.float32),
+        "rewards": np.array(rewards, dtype=np.float32),
+        "next_observations": np.array(next_observations, dtype=np.float32),
+        "terminals": np.array(terminals, dtype=np.float32),
+    }
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -835,12 +901,34 @@ class ContinuousCQL:
 
 @pyrallis.wrap()
 def train(config: TrainConfig):
-    env = gym.make(config.env)
+    # Load Minari dataset
+    # Minari uses the same naming convention for D4RL datasets
+    # e.g., "halfcheetah-medium-expert-v2" -> "halfcheetah-medium-expert-v2"
+    minari_dataset = minari.load_dataset(config.env)
+    
+    # Convert Minari dataset to qlearning format
+    dataset = minari_to_qlearning_dataset(minari_dataset)
+    
+    # Create environment for evaluation
+    # Extract base environment name (e.g., "halfcheetah-medium-expert-v2" -> "halfcheetah")
+    # For most MuJoCo envs, we can use the dataset's env_spec
+    try:
+        # Try to get environment from Minari dataset metadata
+        env_spec = minari_dataset.env_spec
+        if env_spec is not None:
+            env = gym.make(env_spec.id)
+        else:
+            # Fallback: extract base name from config.env
+            base_name = config.env.split("-")[0]
+            env = gym.make(f"{base_name}-v0")
+    except Exception:
+        # Final fallback: try to create env from config name directly
+        # Remove dataset suffix if present (e.g., "-medium-expert-v2" -> "")
+        base_name = config.env.split("-medium")[0].split("-expert")[0].split("-random")[0].split("-replay")[0]
+        env = gym.make(f"{base_name}-v0")
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-
-    dataset = d4rl.qlearning_dataset(env)
 
     if config.normalize_reward:
         modify_reward(
@@ -933,9 +1021,19 @@ def train(config: TrainConfig):
         "cql_clip_diff_max": config.cql_clip_diff_max,
     }
 
-    print("---------------------------------------")
-    print(f"Training CQL, Env: {config.env}, Seed: {seed}")
-    print("---------------------------------------")
+    print("=" * 70)
+    print(f"Training CQL")
+    print("=" * 70)
+    print(f"Environment: {config.env}")
+    print(f"Seed: {seed}")
+    print(f"Device: {config.device}")
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
+    print(f"Max timesteps: {config.max_timesteps:,}")
+    print(f"Batch size: {config.batch_size}")
+    print(f"Evaluation frequency: {config.eval_freq:,} steps")
+    print(f"CQL alpha: {config.cql_alpha}")
+    print(f"Policy LR: {config.policy_lr}, QF LR: {config.qf_lr}")
+    print("=" * 70)
 
     # Initialize actor
     trainer = ContinuousCQL(**kwargs)
@@ -948,14 +1046,47 @@ def train(config: TrainConfig):
     wandb_init(asdict(config))
 
     evaluations = []
+    start_time = time.time()
+    log_freq = max(100, config.eval_freq // 10)  # Log progress every 10% of eval_freq
+    
+    print("\nStarting training...")
+    print("-" * 70)
+    
     for t in range(int(config.max_timesteps)):
         batch = replay_buffer.sample(config.batch_size)
         batch = [b.to(config.device) for b in batch]
         log_dict = trainer.train(batch)
         wandb.log(log_dict, step=trainer.total_it)
+        
+        # Progress logging
+        if (t + 1) % log_freq == 0:
+            elapsed_time = time.time() - start_time
+            progress = (t + 1) / config.max_timesteps * 100
+            steps_per_sec = (t + 1) / elapsed_time if elapsed_time > 0 else 0
+            eta_seconds = (config.max_timesteps - (t + 1)) / steps_per_sec if steps_per_sec > 0 else 0
+            eta_minutes = eta_seconds / 60
+            
+            print(f"\n[{t + 1:,}/{config.max_timesteps:,}] ({progress:.1f}%) | "
+                  f"Time: {elapsed_time/60:.1f}m | "
+                  f"Speed: {steps_per_sec:.1f} steps/s | "
+                  f"ETA: {eta_minutes:.1f}m")
+            print(f"  Policy Loss: {log_dict.get('policy_loss', 0):.4f} | "
+                  f"QF1 Loss: {log_dict.get('qf1_loss', 0):.4f} | "
+                  f"QF2 Loss: {log_dict.get('qf2_loss', 0):.4f}")
+            print(f"  Avg Q1: {log_dict.get('average_qf1', 0):.3f} | "
+                  f"Avg Q2: {log_dict.get('average_qf2', 0):.3f} | "
+                  f"Alpha: {log_dict.get('alpha', 0):.4f}")
+            print(f"  CQL QF1 Diff: {log_dict.get('cql_qf1_diff', 0):.4f} | "
+                  f"CQL QF2 Diff: {log_dict.get('cql_qf2_diff', 0):.4f}")
+        
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
-            print(f"Time steps: {t + 1}")
+            eval_start_time = time.time()
+            eval_progress = (t + 1) / config.max_timesteps * 100
+            print("\n" + "=" * 70)
+            print(f"Evaluation at step {t + 1:,} ({eval_progress:.1f}% complete)")
+            print("=" * 70)
+            
             eval_scores = eval_actor(
                 env,
                 actor,
@@ -964,23 +1095,54 @@ def train(config: TrainConfig):
                 seed=config.seed,
             )
             eval_score = eval_scores.mean()
-            normalized_eval_score = env.get_normalized_score(eval_score) * 100.0
+            eval_std = eval_scores.std()
+            eval_min = eval_scores.min()
+            eval_max = eval_scores.max()
+            
+            # Minari doesn't have get_normalized_score, so we use raw score
+            # You can implement normalization manually if needed
+            normalized_eval_score = eval_score  # Use raw score, or implement custom normalization
             evaluations.append(normalized_eval_score)
-            print("---------------------------------------")
-            print(
-                f"Evaluation over {config.n_episodes} episodes: "
-                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
-            )
-            print("---------------------------------------")
+            
+            eval_time = time.time() - eval_start_time
+            
+            print(f"Evaluation Results ({config.n_episodes} episodes, {eval_time:.1f}s):")
+            print(f"  Mean Score: {eval_score:.3f} ± {eval_std:.3f}")
+            print(f"  Min Score: {eval_min:.3f}, Max Score: {eval_max:.3f}")
+            if len(evaluations) > 1:
+                print(f"  Best Score So Far: {max(evaluations):.3f}")
+                print(f"  Improvement: {evaluations[-1] - evaluations[0]:.3f}")
+            print("=" * 70)
+            
             if config.checkpoints_path:
-                torch.save(
-                    trainer.state_dict(),
-                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
-                )
+                checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{t + 1}.pt")
+                torch.save(trainer.state_dict(), checkpoint_path)
+                print(f"Checkpoint saved: {checkpoint_path}")
+            
             wandb.log(
-                {"d4rl_normalized_score": normalized_eval_score},
+                {
+                    "eval_score": normalized_eval_score,
+                    "eval_std": eval_std,
+                    "eval_min": eval_min,
+                    "eval_max": eval_max,
+                },
                 step=trainer.total_it,
             )
+            print()  # Empty line for readability
+    
+    # Final summary
+    total_time = time.time() - start_time
+    print("\n" + "=" * 70)
+    print("Training Complete!")
+    print("=" * 70)
+    print(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+    print(f"Total steps: {config.max_timesteps:,}")
+    print(f"Average speed: {config.max_timesteps/total_time:.1f} steps/s")
+    if evaluations:
+        print(f"\nFinal Evaluation Score: {evaluations[-1]:.3f}")
+        print(f"Best Evaluation Score: {max(evaluations):.3f}")
+        print(f"Average Evaluation Score: {sum(evaluations)/len(evaluations):.3f}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
