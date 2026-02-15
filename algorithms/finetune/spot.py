@@ -284,32 +284,39 @@ def is_goal_reached(reward: float, info: Dict) -> bool:
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, int, float]:
     # Gymnasium uses reset(seed=seed) instead of seed()
     env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     successes = []
+    terminations = []
     for _ in range(n_episodes):
         # Gymnasium reset() returns (observation, info) tuple
         state, _ = env.reset()
         done = False
         episode_reward = 0.0
         goal_achieved = False
+        episode_terminated = False
         while not done:
             action = actor.act(state, device)
             # Gymnasium step() returns (observation, reward, terminated, truncated, info)
             state, reward, terminated, truncated, env_infos = env.step(action)
             done = terminated or truncated
+            if terminated:
+                episode_terminated = True
             episode_reward += reward
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
         # Valid only for environments with goal
         successes.append(float(goal_achieved))
         episode_rewards.append(episode_reward)
+        terminations.append(float(episode_terminated))
 
     actor.train()
-    return np.asarray(episode_rewards), np.mean(successes)
+    termination_count = int(sum(terminations))
+    termination_rate = np.mean(terminations)
+    return np.asarray(episode_rewards), np.mean(successes), termination_count, termination_rate
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:

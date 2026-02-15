@@ -250,26 +250,33 @@ def wandb_init(config: dict) -> None:
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> np.ndarray:
+) -> Tuple[np.ndarray, int, float]:
     # Gymnasium uses reset(seed=seed) instead of seed()
     env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
+    terminations = []
     for _ in range(n_episodes):
         # Gymnasium reset() returns (observation, info) tuple
         state, _ = env.reset()
         done = False
         episode_reward = 0.0
+        episode_terminated = False
         while not done:
             action = actor.act(state, device)
             # Gymnasium step() returns (observation, reward, terminated, truncated, info)
             state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
+            if terminated:
+                episode_terminated = True
             episode_reward += reward
         episode_rewards.append(episode_reward)
+        terminations.append(float(episode_terminated))
 
     actor.train()
-    return np.asarray(episode_rewards)
+    termination_count = int(sum(terminations))
+    termination_rate = np.mean(terminations)
+    return np.asarray(episode_rewards), termination_count, termination_rate
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -742,7 +749,7 @@ def train(config: TrainConfig):
             print(f"Evaluation at step {t + 1:,} ({eval_progress:.1f}% complete)")
             print("=" * 70)
             
-            eval_scores = eval_actor(
+            eval_scores, eval_termination_count, eval_termination_rate = eval_actor(
                 env,
                 actor,
                 device=config.device,
@@ -764,10 +771,17 @@ def train(config: TrainConfig):
             print(f"Evaluation Results ({config.n_episodes} episodes, {eval_time:.1f}s):")
             print(f"  Mean Score: {eval_score:.3f} ± {eval_std:.3f}")
             print(f"  Min Score: {eval_min:.3f}, Max Score: {eval_max:.3f}")
+            print(f"  Terminations: {eval_termination_count}/{config.n_episodes} ({eval_termination_rate:.1%})")
             if len(evaluations) > 1:
                 print(f"  Best Score So Far: {max(evaluations):.3f}")
                 print(f"  Improvement: {evaluations[-1] - evaluations[0]:.3f}")
             print("=" * 70)
+            
+            # Log termination metrics to wandb
+            wandb.log({
+                "eval/termination_count": eval_termination_count,
+                "eval/termination_rate": eval_termination_rate
+            }, step=trainer.total_it)
             
             if config.checkpoints_path is not None:
                 checkpoint_path = os.path.join(config.checkpoints_path, f"checkpoint_{t + 1}.pt")

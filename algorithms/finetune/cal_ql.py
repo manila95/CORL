@@ -295,32 +295,39 @@ def is_goal_reached(reward: float, info: Dict) -> bool:
 @torch.no_grad()
 def eval_actor(
     env: gym.Env, actor: nn.Module, device: str, n_episodes: int, seed: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, int, float]:
     # Gymnasium uses reset(seed=seed) instead of seed()
     env.reset(seed=seed)
     actor.eval()
     episode_rewards = []
     successes = []
+    terminations = []
     for _ in range(n_episodes):
         # Gymnasium reset() returns (observation, info) tuple
         state, _ = env.reset()
         done = False
         episode_reward = 0.0
         goal_achieved = False
+        episode_terminated = False
         while not done:
             action = actor.act(state, device)
             # Gymnasium step() returns (observation, reward, terminated, truncated, info)
             state, reward, terminated, truncated, env_infos = env.step(action)
             done = terminated or truncated
+            if terminated:
+                episode_terminated = True
             episode_reward += reward
             if not goal_achieved:
                 goal_achieved = is_goal_reached(reward, env_infos)
                 # Valid only for environments with goal
         successes.append(float(goal_achieved))
         episode_rewards.append(episode_reward)
+        terminations.append(float(episode_terminated))
 
     actor.train()
-    return np.asarray(episode_rewards), np.mean(successes)
+    termination_count = int(sum(terminations))
+    termination_rate = np.mean(terminations)
+    return np.asarray(episode_rewards), np.mean(successes), termination_count, termination_rate
 
 
 def return_reward_range(dataset: Dict, max_episode_steps: int) -> Tuple[float, float]:
@@ -1225,6 +1232,8 @@ def train(config: TrainConfig):
 
     eval_successes = []
     train_successes = []
+    total_train_terminations = 0
+    total_train_episodes = 0
     
     start_time = time.time()
     total_iterations = int(config.offline_iterations) + int(config.online_iterations)
@@ -1263,6 +1272,9 @@ def train(config: TrainConfig):
             real_done = False  # Episode can timeout which is different from done
             if done and episode_step < max_steps:
                 real_done = True
+                # Track terminations during online training
+                if terminated:
+                    total_train_terminations += 1
 
             if config.normalize_reward:
                 reward = modify_reward_online(
@@ -1276,6 +1288,8 @@ def train(config: TrainConfig):
             state = next_state
 
             if done:
+                # Track episode completion
+                total_train_episodes += 1
                 # Gymnasium reset() returns (observation, info) tuple
                 state, _ = env.reset()
                 done = False
@@ -1288,6 +1302,12 @@ def train(config: TrainConfig):
                 # Minari doesn't have get_normalized_score, so we use raw score
                 online_log["train/episode_return_normalized"] = episode_return
                 online_log["train/episode_length"] = episode_step
+                # Track termination rate
+                if total_train_episodes > 0:
+                    termination_rate = total_train_terminations / total_train_episodes
+                    online_log["train/termination_rate"] = termination_rate
+                    online_log["train/total_terminations"] = total_train_terminations
+                    online_log["train/total_episodes"] = total_train_episodes
                 episode_return = 0
                 episode_step = 0
                 goal_achieved = False
@@ -1327,8 +1347,13 @@ def train(config: TrainConfig):
                   f"QF1 Loss: {log_dict.get('qf1_loss', 0):.4f} | "
                   f"QF2 Loss: {log_dict.get('qf2_loss', 0):.4f}")
             if t >= config.offline_iterations:
+                term_rate = online_log.get('train/termination_rate', 0)
+                term_count = online_log.get('train/total_terminations', 0)
+                term_episodes = online_log.get('train/total_episodes', 0)
                 print(f"  Episode Return: {online_log.get('train/episode_return', 0):.3f} | "
                       f"Episode Length: {online_log.get('train/episode_length', 0):.0f}")
+                if term_episodes > 0:
+                    print(f"  Terminations: {term_count}/{term_episodes} ({term_rate:.1%})")
         
         # Evaluate episode
         if (t + 1) % config.eval_freq == 0:
@@ -1339,7 +1364,7 @@ def train(config: TrainConfig):
             print(f"Evaluation at step {t + 1:,} ({eval_progress:.1f}% complete) [{phase}]")
             print("=" * 70)
             
-            eval_scores, success_rate = eval_actor(
+            eval_scores, success_rate, eval_termination_count, eval_termination_rate = eval_actor(
                 eval_env,
                 actor,
                 device=config.device,
@@ -1360,6 +1385,8 @@ def train(config: TrainConfig):
                 eval_log["eval/regret"] = np.mean(1 - np.array(eval_successes))
                 eval_log["eval/success_rate"] = success_rate
             eval_log["eval/score"] = normalized_eval_score
+            eval_log["eval/termination_count"] = eval_termination_count
+            eval_log["eval/termination_rate"] = eval_termination_rate
             evaluations.append(normalized_eval_score)
             
             eval_time = time.time() - eval_start_time
@@ -1367,6 +1394,7 @@ def train(config: TrainConfig):
             print(f"Evaluation Results ({config.n_episodes} episodes, {eval_time:.1f}s):")
             print(f"  Mean Score: {eval_score:.3f} ± {eval_std:.3f}")
             print(f"  Min Score: {eval_min:.3f}, Max Score: {eval_max:.3f}")
+            print(f"  Terminations: {eval_termination_count}/{config.n_episodes} ({eval_termination_rate:.1%})")
             if is_env_with_goal and t >= config.offline_iterations:
                 print(f"  Success Rate: {success_rate:.3f}")
             if len(evaluations) > 1:
