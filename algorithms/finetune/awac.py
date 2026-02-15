@@ -528,7 +528,7 @@ def wandb_init(config: dict) -> None:
 def train(config: TrainConfig):
     # Load Minari dataset
     # Minari uses the same naming convention for D4RL datasets
-    minari_dataset = minari.load_dataset(config.env_name)
+    minari_dataset = minari.load_dataset(config.env_name, download=True)
     
     # Convert Minari dataset to qlearning format
     dataset = minari_to_qlearning_dataset(minari_dataset)
